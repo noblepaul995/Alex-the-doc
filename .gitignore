@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.alex
+# Environment
+.env
+.__init__.py
+*/__init__.py
+*/__pycache__/
+
+# docwriter runtime data
+.docwriter/
+docs/*
+!docs/.gitkeep
+cache/*
+!cache/.gitkeep
+.alex/
+
+eval_output
+eval_output_*/
+# OS
+.DS_Store
