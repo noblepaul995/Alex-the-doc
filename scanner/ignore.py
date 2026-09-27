@@ -6,7 +6,8 @@ Three independent layers:
 1. Path-based ignoring (`IgnoreRules`) — `.gitignore` files (root and
    nested, matching real Git semantics via `pathspec`) plus a hard-coded
    set of directories/files that should never be scanned regardless of
-   `.gitignore` (`.git`, `node_modules`, virtualenvs, build output, ...).
+   `.gitignore` (`.git`, `node_modules`, virtualenvs, build output,
+   AI coding assistant config directories like `.claude`/`.cursor`, ...).
    These "always ignore" entries exist because plenty of real repos
    don't bother excluding them (e.g. a `.git` directory is implicit).
 
@@ -57,6 +58,21 @@ ALWAYS_IGNORE_DIRS: frozenset[str] = frozenset(
         "coverage",
         ".alex",
         "egg-info",
+        # AI coding assistant / tool config directories — local
+        # configuration and chat/session history for the tool itself,
+        # not part of the project being documented.
+        ".claude",
+        ".openai",
+        ".continue",
+        ".cursor",
+        ".codeium",
+        ".windsurf",
+        ".aider",
+        ".copilot",
+        ".github-copilot",
+        ".cody",
+        ".amazonq",
+        ".gemini",
     }
 )
 
