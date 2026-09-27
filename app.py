@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 from typing import Annotated
@@ -805,7 +806,7 @@ def github(
 
     cache_root = Path.home() / ".alex" / "github-repos" / f"{owner}__{repo_name}"
     if cache_root.exists():
-        shutil.rmtree(cache_root)
+        _force_rmtree(cache_root)
     console.print(f"\nCloning {owner}/{repo_name}...")
     try:
         clone_repo(owner, repo_name, cache_root, token=token, branch=access.default_branch)

@@ -109,11 +109,14 @@ def _confirm(prompt: str) -> bool:
 def _spawn_open_websearch(settings: Settings, port: int) -> subprocess.Popen:
     log.info("Starting open-websearch (`npx -y open-websearch@latest`) on port %d ...", port)
     env = {**os.environ, "PORT": str(port), "MODE": "http"}
-    return subprocess.Popen(  # noqa: S603 — argv is a fixed literal list, nothing from user input reaches it
-        ["npx", "-y", "open-websearch@latest"],
+    args = ["npx", "-y", "open-websearch@latest"]
+    ...
+    return subprocess.Popen(
+        args,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         env=env,
+        shell=(sys.platform == "win32"),
     )
 
 
