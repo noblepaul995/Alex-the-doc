@@ -13,6 +13,7 @@ which is the best available proof that the foundation actually works.
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -26,13 +27,16 @@ from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
 
 from agents.export_agent import SUPPORTED_FORMATS, export_documentation
+from agents.qa_agent import investigate
 from config.model_recommendations import recommend_tier
-from config.providers import PROVIDER_REGISTRY, ProviderType, resolve_provider_config
+from config.providers import PROVIDER_REGISTRY, ProviderType, resolve_provider_config, resolve_synthesis_provider_config
 from config.settings import Settings, get_settings
-from graph.graph import build_graph, build_scan_graph
+from embeddings.lancedb import LanceVectorStore
+from graph.graph import QA_GRAPH_NODE_COUNT, build_graph, build_qa_graph, build_scan_graph
 from graph.state import RepositoryState
-from llm.base import ChatMessage, ProviderError, Role
+from llm.base import BaseProvider, ChatMessage, ProviderError, Role
 from llm.factory import create_provider
+from utils.github_repo import RepoAccessResult, check_repo_access, clone_repo, parse_github_url
 from utils.hardware_detect import HardwareInfo, detect_hardware
 from utils.logger import configure_logging, get_logger
 from utils.progress import progress_scope
@@ -66,7 +70,9 @@ _STAGE_LABELS: dict[str, str] = {
 }
 
 
-async def _run_with_progress(graph: object, initial_state: RepositoryState) -> dict[str, object]:
+async def _run_with_progress(
+    graph: object, initial_state: RepositoryState, *, total_stages: int | None = None
+) -> dict[str, object]:
     """
     Run a compiled graph via `astream()` instead of `ainvoke()`, driving a
     live progress display so a medium/large repo doesn't look stuck:
@@ -75,6 +81,12 @@ async def _run_with_progress(graph: object, initial_state: RepositoryState) -> d
       - `chunk_doc` and `file_doc` (the two stages that dominate runtime,
         one LLM call per chunk/file) get their own live item-count bars,
         fed by `utils.progress.report_progress` via `progress_scope`
+
+    `total_stages` overrides the bar's total node count — needed for any
+    graph other than the full `build_graph()` (e.g. `build_qa_graph()`,
+    which only runs 6 of the pipeline's ~19 nodes), since the bar would
+    otherwise stall partway and look broken rather than reaching 100%.
+    Defaults to `len(_STAGE_LABELS)`, correct for `build_graph()` itself.
 
     Returns the same shape `ainvoke()` would: a dict of the final state's
     fields. Safe because every node in this codebase returns the *full*
@@ -90,7 +102,7 @@ async def _run_with_progress(graph: object, initial_state: RepositoryState) -> d
         TimeElapsedColumn(),
         console=console,
     ) as progress:
-        pipeline_task = progress.add_task("Pipeline", total=len(_STAGE_LABELS))
+        pipeline_task = progress.add_task("Pipeline", total=total_stages if total_stages is not None else len(_STAGE_LABELS))
         item_tasks: dict[str, int] = {}
 
         def _on_item_progress(stage: str, completed: int, total: int) -> None:
@@ -136,6 +148,26 @@ log = get_logger(__name__)
 def _setup(verbose: bool = False) -> None:
     settings = get_settings()
     configure_logging("DEBUG" if verbose else settings.log_level.value)
+
+
+def _force_rmtree(path: Path) -> None:
+    """
+    `shutil.rmtree`, but tolerant of read-only files — specifically git's
+    own pack/object files, which git (and Windows' filesystem permission
+    model in particular) leaves read-only after a clone. Plain
+    `shutil.rmtree` on Windows raises `PermissionError: Access is denied`
+    the moment it hits one of these, since Windows (unlike POSIX, where
+    the containing directory's permissions are what matter) checks the
+    file's own read-only bit before allowing a delete. The `onerror`
+    hook here clears that bit and retries the specific failed operation
+    once, rather than aborting the whole tree removal.
+    """
+
+    def _on_error(func, failed_path, exc_info) -> None:  # noqa: ANN001 — matches shutil's onerror signature
+        os.chmod(failed_path, stat.S_IWRITE)
+        func(failed_path)
+
+    shutil.rmtree(path, onerror=_on_error)
 
 
 @cli.command()
@@ -677,6 +709,154 @@ def setup(verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False) -> 
 
     _write_env(provider="ollama", model=chosen)
     _test_provider(ProviderType.OLLAMA, chosen)
+
+
+async def _qa_loop(state: RepositoryState, settings: Settings) -> None:
+    """
+    Interactive question-answering loop, backed by `agents/qa_agent.py`'s
+    agentic investigation loop rather than a single retrieve-then-answer
+    pass — a real test run showed the single-shot version falling back
+    to "it can be inferred"/"it seems that" on multi-hop questions
+    (e.g. "how are the server, scheduler, and engine connected?") when
+    the first retrieval pass didn't happen to cover the whole answer.
+    Giving the model tools to keep investigating instead of answering
+    with whatever the first search returned is the fix.
+    """
+    store = await LanceVectorStore.connect(settings.vector_dir)
+    if await store.count() == 0:
+        console.print("[yellow]No indexed content found[/yellow] — nothing to answer questions from.")
+        return
+
+    # The Q&A investigation loop is multi-step, reasoning-heavy, and runs once per question rather
+    # than once per chunk/file — the same cost/quality tradeoff `resolve_synthesis_provider_config()`
+    # already exists for (see its docstring / `settings.synthesis_provider`). A small per-chunk model
+    # that's fine for summarizing individual files is frequently unreliable at multi-step tool-use
+    # (malformed ACTION calls, ignoring the protocol, asserting untested conclusions after the step
+    # cap) — using the stronger synthesis-tier model here directly attacks that, the same way it
+    # already does for the README/Architecture/Repository/Review agents.
+    config = resolve_synthesis_provider_config(settings)
+    console.print(
+        "\n[bold]Ask anything about this repository.[/bold] Type [cyan]exit[/cyan] or [cyan]quit[/cyan] to stop.\n"
+    )
+    async with create_provider(config) as provider:
+        while True:
+            question = Prompt.ask("[bold cyan]?[/bold cyan]").strip()
+            if not question:
+                continue
+            if question.lower() in ("exit", "quit"):
+                break
+            try:
+                answer = await investigate(question, state, state.repo_summary, provider, store)
+            except ProviderError as exc:
+                console.print(f"[red]Couldn't get an answer:[/red] {exc}")
+                continue
+            console.print(f"\n{answer}\n")
+
+
+@cli.command()
+def github(
+    repo: Annotated[str, typer.Argument(help="A GitHub repo: a URL, git@ SSH form, or plain 'owner/repo'.")],
+    verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
+) -> None:
+    """
+    Point alex at a GitHub repository: checks whether it's public or
+    private (and whether you have access if it's private), clones it,
+    then lets you choose between building full documentation or asking
+    ad-hoc questions about it (Q&A, via an agentic investigation loop —
+    the model can search the repository, read real file contents, look
+    up symbols, and trace import relationships across several steps
+    before answering, rather than a single retrieve-then-answer pass).
+    """
+    _setup(verbose)
+
+    parsed = parse_github_url(repo)
+    if parsed is None:
+        console.print(
+            f"[red]Couldn't parse a GitHub repo from[/red] {repo!r}. "
+            "Try a full URL (https://github.com/owner/repo), the SSH form, or just 'owner/repo'."
+        )
+        raise typer.Exit(code=1)
+    owner, repo_name = parsed
+    console.print(f"[bold]alex github[/bold] — {owner}/{repo_name}\n")
+
+    settings = get_settings()
+    token = settings.github_token
+
+    console.print("Checking repository access...")
+    access: RepoAccessResult = asyncio.run(check_repo_access(owner, repo_name, token))
+
+    if not access.exists and not token:
+        console.print(f"[yellow]{owner}/{repo_name} wasn't found anonymously[/yellow] ({access.detail}).")
+        if Confirm.ask("Do you have a GitHub token to check private access with?", default=False):
+            token = Prompt.ask("GitHub token", password=True)
+            access = asyncio.run(check_repo_access(owner, repo_name, token))
+
+    if not access.exists:
+        console.print(f"[red]Can't access {owner}/{repo_name}.[/red] {access.detail}.")
+        raise typer.Exit(code=1)
+
+    visibility = "private" if access.private else "public"
+    console.print(f"[green]Found it[/green] — {owner}/{repo_name} is {visibility}, and you have access.\n")
+
+    console.print("[bold]What would you like to do?[/bold]")
+    console.print("  [cyan]1[/cyan]. Build full documentation (README, architecture, API reference, ...)")
+    console.print("  [cyan]2[/cyan]. Ask questions about the repo (Q&A)")
+    choice = Prompt.ask("Choice", choices=["1", "2"], default="1")
+
+    cache_root = Path.home() / ".alex" / "github-repos" / f"{owner}__{repo_name}"
+    if cache_root.exists():
+        shutil.rmtree(cache_root)
+    console.print(f"\nCloning {owner}/{repo_name}...")
+    try:
+        clone_repo(owner, repo_name, cache_root, token=token, branch=access.default_branch)
+    except RuntimeError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]Cloned[/green] to {cache_root}\n")
+
+    # Every relative .alex/* path (cache, vector store, docs output) is
+    # resolved against the process's current working directory, same as
+    # a normal `alex document <path>` run assumes — chdir'ing into the
+    # clone for the duration of this command is what keeps its cache and
+    # vector store scoped to *this* clone rather than colliding with
+    # whatever `.alex/` directory happens to sit in the user's own cwd.
+    original_cwd = Path.cwd()
+    repo_path = cache_root.resolve()
+    try:
+        os.chdir(repo_path)
+        get_settings.cache_clear()
+        settings = get_settings()
+
+        if choice == "1":
+            graph = build_graph()
+            result = asyncio.run(_run_with_progress(graph, RepositoryState(repository_path=repo_path)))
+            if result.get("errors"):
+                console.print("[red]Errors during run:[/red]")
+                for error in result["errors"]:
+                    console.print(f"  - {error.message if hasattr(error, 'message') else error}")
+
+            state = RepositoryState(**result)
+            output_dir = settings.docs_dir
+            written = export_documentation(state, ["markdown"], output_dir)
+            console.print(f"\n[bold]Exported to[/bold] [cyan]{(repo_path / output_dir).resolve()}[/cyan]")
+            for format_name, paths in written.items():
+                for path in paths:
+                    console.print(f"  {format_name}: {path}")
+        else:
+            graph = build_qa_graph()
+            result = asyncio.run(
+                _run_with_progress(
+                    graph, RepositoryState(repository_path=repo_path), total_stages=QA_GRAPH_NODE_COUNT
+                )
+            )
+            if result.get("errors"):
+                console.print("[red]Errors during run:[/red]")
+                for error in result["errors"]:
+                    console.print(f"  - {error.message if hasattr(error, 'message') else error}")
+            asyncio.run(_qa_loop(RepositoryState(**result), settings))
+    finally:
+        os.chdir(original_cwd)
+        get_settings.cache_clear()
 
 
 if __name__ == "__main__":

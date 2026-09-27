@@ -145,6 +145,7 @@ from graph.state import RepositoryState
 from graph.stages import STAGE_ORDER, render_stage_order  # noqa: F401 - re-exported for convenience
 from utils.logger import get_logger
 
+QA_GRAPH_NODE_COUNT = 11
 log = get_logger(__name__)
 
 
@@ -200,6 +201,45 @@ def build_scan_graph() -> StateGraph:
 # agents can import it as ground truth without a circular import (this
 # module already imports every agent's node function). If you change the
 # wiring below, update graph/stages.py's STAGE_ORDER to match.
+
+
+def build_qa_graph() -> StateGraph:
+    """
+    Construct and compile the retrieval-ready pipeline:
+    `build_graph()`'s nodes through `repository_understanding`
+    (inclusive), then straight to `END` — skipping the entire
+    architecture/api/readme/structure/changelog/package_dependencies/
+    githubReadme/review fan-out.
+
+    This exists for `alex github`'s Q&A path: answering questions needs
+    chunks, file docs, embeddings, and a populated vector DB (everything
+    through `vector_db`), plus `repo_summary` as useful top-level context
+    for the answering prompt (hence stopping one node later, at
+    `repository_understanding`, rather than at `vector_db` itself) — but
+    has no use for a generated README, architecture doc, or any of the
+    other synthesis-stage documents, which is where nearly all of a full
+    run's LLM cost and wall-clock time actually goes. Running the full
+    `build_graph()` just to throw away everything after
+    `repository_understanding` would work, but would silently burn
+    several LLM calls (and real money, for a hosted provider) a user
+    only asking questions never asked for.
+    """
+    graph = StateGraph(RepositoryState)
+    _add_scan_pipeline_nodes(graph)
+    graph.add_node("chunk_doc", chunk_doc_node)
+    graph.add_node("file_doc", file_doc_node)
+    graph.add_node("knowledge_graph", knowledge_graph_node)
+    graph.add_node("embed", embedder_node)
+    graph.add_node("vector_db", vector_db_node)
+    graph.add_node("repository_understanding", repository_understanding_node)
+    graph.add_edge("chunk", "chunk_doc")
+    graph.add_edge("chunk_doc", "file_doc")
+    graph.add_edge("file_doc", "knowledge_graph")
+    graph.add_edge("knowledge_graph", "embed")
+    graph.add_edge("embed", "vector_db")
+    graph.add_edge("vector_db", "repository_understanding")
+    graph.add_edge("repository_understanding", END)
+    return graph.compile()
 
 
 def build_graph() -> StateGraph:

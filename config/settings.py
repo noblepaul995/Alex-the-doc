@@ -66,6 +66,28 @@ class Settings(BaseSettings):
 
     lmstudio_endpoint: str = Field(default="http://localhost:1234/v1", alias="LMSTUDIO_ENDPOINT")
 
+    github_token: str | None = Field(default=None, alias="GITHUB_TOKEN")
+    """Personal access token for `alex github` to check access to, and clone, private repositories. Not required for public repos."""
+
+    tavily_api_key: str | None = Field(default=None, alias="TAVILY_API_KEY")
+    """API key for `utils/web_search.py`. Not required — search is only ever used as an explicit tool an agent chooses to call, never automatically, so its absence just means that tool isn't offered."""
+
+    open_websearch_endpoint: str | None = Field(default=None, alias="OPEN_WEBSEARCH_ENDPOINT")
+    """Base URL of an already-running open-websearch daemon (https://github.com/Aas-ee/open-webSearch),
+    e.g. `http://localhost:3000`. Preferred over Tavily in `utils/web_search.py` when reachable — no
+    API key, self-hosted. Leave unset to let `open_websearch_port` below decide where to look (and,
+    if `open_websearch_autostart` is on, where to start one)."""
+
+    open_websearch_port: int = Field(default=3000, ge=1, le=65535, alias="OPEN_WEBSEARCH_PORT")
+    """Port used to reach (or start) a local open-websearch daemon when `open_websearch_endpoint`
+    isn't set. 3000 is the project's own documented default (`PORT` env var on their side)."""
+
+    open_websearch_autostart: bool = Field(default=True, alias="OPEN_WEBSEARCH_AUTOSTART")
+    """If no open-websearch daemon is reachable, let `utils/web_search.py` try to start one itself
+    with `npx -y open-websearch@latest` (asking for confirmation first when running interactively).
+    Set to `false` to only ever use one that's already running, or to fall back to Tavily/be
+    unavailable without ever spawning anything."""
+
     # --- Paths ---------------------------------------------------------------
     cache_dir: Path = Field(default=Path(".alex/cache"), alias="ALEX_CACHE_DIR")
     db_path: Path = Field(default=Path(".alex/memory.sqlite3"), alias="ALEX_DB_PATH")
