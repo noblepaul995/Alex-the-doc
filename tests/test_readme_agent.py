@@ -187,6 +187,45 @@ class TestLocateSentence:
         assert start == 0
         assert sentence.strip() == "This promotes flexibility."
 
+    def test_ignores_dots_inside_backticks_abbreviations_and_versions(self) -> None:
+        text = (
+            "Intro. Modules like `agents/readme_agent.py` (e.g. `state.generated_docs` v0.1.0) "
+            "seamlessly handle this. Next sentence."
+        )
+        start, end, sentence = _locate_sentence(text, "seamlessly")
+        assert sentence.strip() == (
+            "Modules like `agents/readme_agent.py` (e.g. `state.generated_docs` v0.1.0) "
+            "seamlessly handle this."
+        )
+
+    @pytest.mark.asyncio
+    async def test_section_scoped_revision_preserves_untouched_sections(self, tmp_path: Path) -> None:
+        state = _state_with_file(tmp_path)
+        digest = build_digest(state, max_files=40)
+        draft = (
+            "# Demo\n\nIntro paragraph.\n\n"
+            "## Overview\n\nThis section has no issues.\n\n"
+            "## Pipeline\n\nX and Y run in parallel here.\n\n"
+            "## License\n\nMIT"
+        )
+        provider = _FakeProvider(
+            responses=[
+                draft,  # draft
+                '- [ordering] "X and Y run in parallel here."',  # critique
+                "## Pipeline\n\nX and Y are both part of the pipeline.",  # section-scoped revise
+                "No issues found.",  # critique round 2: clean
+            ]
+        )
+        readme_text, total_tokens, revision_count = await generate_readme(digest, "A repo.", provider)
+        assert revision_count == 1
+        assert "## Overview\n\nThis section has no issues." in readme_text
+        assert "## License\n\nMIT" in readme_text
+        assert "X and Y are both part of the pipeline." in readme_text
+        # The revise prompt should only contain the ## Pipeline section, not ## Overview
+        revise_prompt = provider.calls[2][0].content
+        assert "## Pipeline" in revise_prompt
+        assert "## Overview" not in revise_prompt
+
 
 class TestFixBannedPhrases:
     @pytest.mark.asyncio
@@ -265,3 +304,82 @@ class TestFixBannedPhrases:
         readme_text, total_tokens, revision_count = await generate_readme(digest, "A repo.", provider)
         assert "promotes flexibility" not in readme_text.lower()
         assert "The pipeline stays flexible" in readme_text
+
+    @pytest.mark.asyncio
+    async def test_nonexistent_file_reference_triggers_revision_even_when_llm_critique_clean(self, tmp_path: Path) -> None:
+        state = _state_with_file(tmp_path)
+        digest = build_digest(state, max_files=40)
+        provider = _FakeProvider(
+            responses=[
+                "# Demo\n\nSee `agents/nonexistent.py` for details.",  # draft
+                "No issues found.",  # LLM critique misses it, deterministic check catches it
+                "# Demo\n\nSee `a.py` for details.",  # revise fixes it
+                "No issues found.",  # critique round 2: clean
+            ]
+        )
+        readme_text, total_tokens, revision_count = await generate_readme(
+            digest, "A repo.", provider, real_paths={"a.py"}, repository_root=tmp_path
+        )
+        assert revision_count == 1
+        assert "agents/nonexistent.py" not in readme_text
+        assert "`a.py`" in readme_text
+        # Revise prompt should have received the deterministic missing-file bullet
+        revise_prompt = provider.calls[2][0].content
+        assert "agents/nonexistent.py" in revise_prompt
+
+    def test_expanded_banned_phrases_detected(self) -> None:
+        from utils.banned_phrases import find_banned_phrases
+
+        text = (
+            "This module plays a crucial role and serves as the backbone of the app. "
+            "It leverages the power of a comprehensive suite of tools, designed with modularity in mind, "
+            "and streamlines the workflow while it follows industry best practices."
+        )
+        hits = [h.lower() for h in find_banned_phrases(text)]
+        assert "plays a crucial role" in hits
+        assert "serves as the backbone" in hits
+        assert "leverages the power of" in hits
+        assert "comprehensive suite of" in hits
+        assert "designed with modularity in mind" in hits
+        assert "streamlines the workflow" in hits
+        assert "follows industry best practices" in hits
+
+    def test_build_setup_context_extracts_manifest_cli_and_env_vars(self, tmp_path: Path) -> None:
+        from agents.readme_agent import build_setup_context
+
+        (tmp_path / "pyproject.toml").write_text(
+            '[project]\nname = "demo"\nrequires-python = ">=3.11"\ndependencies = ["typer>=0.12.0"]\n'
+            '[project.scripts]\ndemo = "app:cli"\n',
+            encoding="utf-8",
+        )
+        (tmp_path / ".env.example").write_text(
+            "# comment\nDEMO_API_KEY=\nDEMO_MODEL=gpt-4o\n",
+            encoding="utf-8",
+        )
+        state = RepositoryState(repository_path=tmp_path)
+        cmd_sym = Symbol(
+            name="serve",
+            kind=SymbolKind.FUNCTION,
+            language="python",
+            span=Span(start_byte=0, end_byte=1, start_line=0, end_line=0),
+            decorators=["@cli.command()"],
+            docstring="Start the local server.",
+        )
+        state.parse_results["app.py"] = ParseResult(file_path="app.py", language="python", symbols=[cmd_sym])
+
+        ctx = build_setup_context(state)
+        assert "pip install -e ." in ctx
+        assert "Python >=3.11" in ctx
+        assert "`demo` (`app:cli`)" in ctx
+        assert "`serve` (`app.py`): Start the local server." in ctx
+        assert "`DEMO_API_KEY`" in ctx
+        assert "`DEMO_MODEL`" in ctx
+
+    @pytest.mark.asyncio
+    async def test_setup_context_passed_to_draft_and_critique_prompts(self, tmp_path: Path) -> None:
+        state = _state_with_file(tmp_path)
+        digest = build_digest(state, max_files=40)
+        provider = _FakeProvider(responses=["# Draft", "No issues found."])
+        await generate_readme(digest, "A repo.", provider, setup_context="Install with `pip install -e .`")
+        assert "Install with `pip install -e .`" in provider.calls[0][0].content
+        assert "Install with `pip install -e .`" in provider.calls[1][0].content

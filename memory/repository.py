@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from database.models import CacheRecord
 from database.sqlite import create_memory_engine, create_session_factory
@@ -91,6 +91,44 @@ class RepositoryMemory:
 
     def save_file_doc(self, repository_path: str, relative_path: str, content_hash: str, doc: FileDocumentation) -> None:
         self._upsert(repository_path, relative_path, _FILE_DOC, content_hash, doc.model_dump_json())
+
+    # --- Introspection & bulk loading (stats / rebuild-index) --------------------
+
+    def get_stats(self, repository_path: str | None = None) -> dict[str, int]:
+        """Return counts of cached records grouped by `record_type`."""
+        stmt = select(CacheRecord.record_type, func.count()).group_by(CacheRecord.record_type)
+        if repository_path is not None:
+            stmt = stmt.where(CacheRecord.repository_path == repository_path)
+        with self._session_factory() as session:
+            rows = session.execute(stmt).all()
+        return {record_type: int(count) for record_type, count in rows}
+
+    def load_all_cached_docs(
+        self, repository_path: str | None = None
+    ) -> tuple[list[ChunkDocumentation], list[FileDocumentation]]:
+        """Load all stored `ChunkDocumentation` and `FileDocumentation` entries for index rebuilding."""
+        chunk_docs: list[ChunkDocumentation] = []
+        file_docs: list[FileDocumentation] = []
+
+        with self._session_factory() as session:
+            chunk_stmt = select(CacheRecord.payload).where(CacheRecord.record_type == _CHUNK_DOCS)
+            file_stmt = select(CacheRecord.payload).where(CacheRecord.record_type == _FILE_DOC)
+            if repository_path is not None:
+                chunk_stmt = chunk_stmt.where(CacheRecord.repository_path == repository_path)
+                file_stmt = file_stmt.where(CacheRecord.repository_path == repository_path)
+
+            for (payload,) in session.execute(chunk_stmt).all():
+                for item in json.loads(payload):
+                    doc = ChunkDocumentation.model_validate(item)
+                    if doc.error is None:
+                        chunk_docs.append(doc)
+
+            for (payload,) in session.execute(file_stmt).all():
+                doc = FileDocumentation.model_validate_json(payload)
+                if doc.error is None:
+                    file_docs.append(doc)
+
+        return chunk_docs, file_docs
 
     # --- Internal helpers --------------------------------------------------------
 

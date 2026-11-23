@@ -7,6 +7,6 @@ Do not add a new relationship you're inferring on your own — only reframe what
 Sentence:
 {sentence}
 
-Output only the rewritten sentence — no quotes, no preamble, no explanation, and do not use any of these words anywhere in your answer: simultaneously, concurrently, in parallel, parallel to, meanwhile.
+Output only the rewritten sentence — no quotes, no preamble, no explanation, and do not use any of these words anywhere in your answer: simultaneously, concurrently, in parallel, parallel to, meanwhile. Ensure the rewritten sentence is complete and grammatical (never leave a dangling verb like "may run." or "execute.").
 
 Rewritten sentence:

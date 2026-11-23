@@ -28,6 +28,8 @@ diagram.
 
 from __future__ import annotations
 
+import re
+from collections import defaultdict
 from dataclasses import dataclass
 
 from config.prompts import render_prompt
@@ -54,6 +56,9 @@ class ArchitectureDigest:
     """One-line-per-file summaries for the selected files, same rendering as the Repository Agent's digest."""
 
 
+_LOW_SIGNAL_UTILITY_BASENAMES = frozenset({"logger.py", "timers.py", "helpers.py"})
+
+
 async def architecture_node(state: RepositoryState) -> dict[str, object]:
     """LangGraph node: generate `state.generated_docs["architecture"]`."""
     all_files = sorted(state.parse_results.keys())
@@ -61,7 +66,13 @@ async def architecture_node(state: RepositoryState) -> dict[str, object]:
         return {"generated_docs": state.generated_docs, "statistics": state.statistics, "errors": state.errors}
 
     max_nodes = get_settings().architecture_max_nodes
-    selected = select_central_files(state.dependency_graph, all_files, max_nodes=max_nodes)
+    candidate_files = [
+        p for p in all_files if p.rsplit("/", 1)[-1] not in _LOW_SIGNAL_UTILITY_BASENAMES
+    ]
+    if len(candidate_files) < min(max_nodes, len(all_files)):
+        candidate_files = all_files
+
+    selected = select_central_files(state.dependency_graph, candidate_files, max_nodes=max_nodes)
     diagram = build_dependency_diagram(selected, state.dependency_graph)
     file_digest = _render_file_digest(selected, state)
     digest = ArchitectureDigest(file_paths=selected, diagram=diagram, file_digest=file_digest)
@@ -93,7 +104,7 @@ async def architecture_node(state: RepositoryState) -> dict[str, object]:
                 try:
                     async for attempt in with_retry(max_attempts=3, exceptions=(ProviderError,)):
                         with attempt:
-                            fix_result = await provider.generate(messages, temperature=0.1, max_tokens=500)
+                            fix_result = await provider.generate(messages, temperature=0.1, max_tokens=900)
                     narrative = fix_result.text.strip()
                     tokens_used += (fix_result.prompt_tokens or 0) + (fix_result.completion_tokens or 0)
                 except ProviderError as exc:
@@ -124,13 +135,28 @@ def select_central_files(dependency_graph: DependencyGraph, all_files: list[str]
 
 
 def build_dependency_diagram(file_paths: list[str], dependency_graph: DependencyGraph) -> str:
-    """Build a Mermaid `flowchart TD` over exactly `file_paths`, including only import edges between them."""
+    """Build a Mermaid `flowchart TD` over exactly `file_paths`, grouping multi-file directories into subgraphs."""
     id_map = {path: f"n{i}" for i, path in enumerate(file_paths)}
 
+    by_dir: dict[str | None, list[str]] = defaultdict(list)
+    for path in file_paths:
+        top_dir = path.split("/", 1)[0] if "/" in path else None
+        by_dir[top_dir].append(path)
+
     lines = ["flowchart TD"]
-    for path, node_id in id_map.items():
-        safe_label = path.replace('"', "'")
-        lines.append(f'    {node_id}["{safe_label}"]')
+    for dir_name, paths in by_dir.items():
+        if dir_name is not None and len(paths) >= 2:
+            safe_sg_id = "sg_" + re.sub(r"[^a-zA-Z0-9_]", "_", dir_name)
+            safe_sg_label = dir_name.replace('"', "'")
+            lines.append(f'    subgraph {safe_sg_id}["{safe_sg_label}/"]')
+            for path in paths:
+                safe_label = path.replace('"', "'")
+                lines.append(f'        {id_map[path]}["{safe_label}"]')
+            lines.append("    end")
+        else:
+            for path in paths:
+                safe_label = path.replace('"', "'")
+                lines.append(f'    {id_map[path]}["{safe_label}"]')
 
     selected_set = set(file_paths)
     seen_edges: set[tuple[str, str]] = set()
@@ -169,6 +195,6 @@ async def generate_architecture_narrative(
 
     async for attempt in with_retry(max_attempts=3, exceptions=(ProviderError,)):
         with attempt:
-            result = await provider.generate(messages, temperature=0.1, max_tokens=500)
+            result = await provider.generate(messages, temperature=0.1, max_tokens=900)
 
     return result.text.strip(), result.prompt_tokens, result.completion_tokens

@@ -99,6 +99,20 @@ class TestBuildDependencyDiagram:
         diagram = build_dependency_diagram(["a.py", "b.py"], dg)
         assert diagram.count("n0 --> n1") == 1
 
+    def test_groups_multi_file_directories_into_subgraphs(self) -> None:
+        dg = DependencyGraph(
+            edges=[DependencyEdge(source="agents/a.py", module="b", targets=["agents/b.py"])]
+        )
+        diagram = build_dependency_diagram(["agents/a.py", "agents/b.py", "utils/c.py", "app.py"], dg)
+        assert 'subgraph sg_agents["agents/"]' in diagram
+        assert '        n0["agents/a.py"]' in diagram
+        assert '        n1["agents/b.py"]' in diagram
+        # Singleton directory and root file stay outside subgraphs
+        assert "sg_utils" not in diagram
+        assert '    n2["utils/c.py"]' in diagram
+        assert '    n3["app.py"]' in diagram
+        assert "n0 --> n1" in diagram
+
 
 class TestGenerateArchitectureNarrative:
     @pytest.mark.asyncio

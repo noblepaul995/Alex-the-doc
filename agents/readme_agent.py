@@ -61,6 +61,10 @@ negligible next to what it buys in caught invention.
 
 from __future__ import annotations
 
+import re
+from collections import defaultdict
+from pathlib import Path
+
 from agents.repo_agent import RepoDigest, build_digest
 from config.prompts import render_prompt
 from config.providers import resolve_synthesis_provider_config
@@ -71,6 +75,8 @@ from llm.base import BaseProvider, ChatMessage, ProviderError, Role
 from llm.factory import create_provider
 from utils.banned_phrases import find_banned_phrases
 from utils.bullet_dedup import dedupe_and_cap_bullets
+from utils.dependency_detect import detect_manifests
+from utils.file_references import find_nonexistent_file_references
 from utils.helpers import with_retry
 from utils.license_detect import detect_license
 from utils.logger import get_logger
@@ -86,6 +92,64 @@ _MAX_CRITIQUE_ISSUES = 8
 """Cap on distinct issues kept from one critique call — see the dedupe_and_cap_bullets call in generate_readme's critique loop. Higher than review_agent.py's equivalent cap (5) since a critique bullet here is typically a single quoted sentence rather than a fuller explanation, so more of them fit usefully in one revise pass."""
 
 
+def build_setup_context(state: RepositoryState) -> str:
+    """
+    Collect verified installation, CLI, and environment-variable facts
+    from package manifests (`utils/dependency_detect.py`), Tree-sitter
+    command decorators (`state.parse_results`), and `.env.example`.
+    """
+    sections: list[str] = []
+
+    manifests = detect_manifests(state.repository_path)
+    if manifests:
+        manifest_lines: list[str] = []
+        for m in manifests:
+            parts = [f"- {m.ecosystem} (`{m.manifest_file}`): install with `{m.install_command}`"]
+            if m.requires:
+                parts.append(f"requires {m.requires}")
+            if m.scripts:
+                scripts_str = ", ".join(f"`{k}` (`{v}`)" for k, v in list(m.scripts.items())[:8])
+                parts.append(f"scripts: {scripts_str}")
+            if m.optional_dependencies:
+                extras = ", ".join(f"`{g}`" for g in m.optional_dependencies if m.optional_dependencies[g])
+                if extras:
+                    parts.append(f"optional extras: {extras}")
+            manifest_lines.append("; ".join(parts))
+        sections.append("Package manifests:\n" + "\n".join(manifest_lines))
+
+    cli_commands: list[str] = []
+    for rel_path, parse_result in sorted(state.parse_results.items()):
+        for sym in parse_result.symbols:
+            if any("command" in dec.lower() for dec in sym.decorators):
+                doc_first = sym.docstring.strip().splitlines()[0].strip() if sym.docstring else ""
+                cli_name = sym.name.replace("_", "-")
+                entry = f"- `{cli_name}` (`{rel_path}`)"
+                if doc_first:
+                    entry += f": {doc_first}"
+                cli_commands.append(entry)
+    if cli_commands:
+        sections.append("CLI commands (from decorators):\n" + "\n".join(cli_commands[:20]))
+
+    env_example = state.repository_path / ".env.example"
+    if env_example.is_file():
+        try:
+            raw_lines = env_example.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            raw_lines = []
+        env_keys: list[str] = []
+        for line in raw_lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key = stripped.split("=", 1)[0].strip()
+            if key and key not in env_keys:
+                env_keys.append(key)
+        if env_keys:
+            sections.append("Environment variables (`.env.example`): " + ", ".join(f"`{k}`" for k in env_keys[:20]))
+
+    return "\n\n".join(sections) if sections else "(none detected)"
+
+
 async def readme_node(state: RepositoryState) -> dict[str, object]:
     """LangGraph node: generate `state.generated_docs["readme"]`."""
     digest = build_digest(state, max_files=get_settings().readme_digest_max_files)
@@ -93,6 +157,8 @@ async def readme_node(state: RepositoryState) -> dict[str, object]:
         return {"generated_docs": state.generated_docs, "statistics": state.statistics, "errors": state.errors}
 
     license_info = detect_license(state.repository_path)
+    real_paths = set(state.file_metadata.keys())
+    setup_context = build_setup_context(state)
 
     config = resolve_synthesis_provider_config()
 
@@ -100,7 +166,13 @@ async def readme_node(state: RepositoryState) -> dict[str, object]:
         async with create_provider(config) as provider:
             try:
                 doc, tokens_used, revision_count = await generate_readme(
-                    digest, state.repo_summary, provider, license_info=license_info
+                    digest,
+                    state.repo_summary,
+                    provider,
+                    license_info=license_info,
+                    real_paths=real_paths,
+                    repository_root=state.repository_path,
+                    setup_context=setup_context,
                 )
             except ProviderError as exc:
                 state.record_error("readme", f"Failed to generate README: {exc}", exception=exc)
@@ -168,6 +240,9 @@ async def generate_readme(
     provider: BaseProvider,
     *,
     license_info: tuple[str | None, str] | None = None,
+    real_paths: set[str] | None = None,
+    repository_root: Path | None = None,
+    setup_context: str | None = None,
 ) -> tuple[str, int, int]:
     """
     Run the draft -> critique -> (conditional) revise chain, looping the
@@ -203,6 +278,8 @@ async def generate_readme(
             "you may say a license file exists and point to it by name, but do not name a specific license type"
         )
 
+    setup_text = setup_context or "(none detected)"
+
     draft_prompt = render_prompt(
         "readme",
         repo_summary=repo_summary or "(not yet established)",
@@ -212,6 +289,7 @@ async def generate_readme(
         dependency_edges=digest.dependency_edges,
         stage_order=stage_order,
         license_summary=license_summary,
+        setup_context=setup_text,
     )
     current, prompt_tokens, completion_tokens, finish_reason = await _call(
         provider, draft_prompt, temperature=0.2, max_tokens=4500
@@ -237,6 +315,7 @@ async def generate_readme(
             dependency_edges=digest.dependency_edges,
             stage_order=stage_order,
             license_summary=license_summary,
+            setup_context=setup_text,
             draft=current,
         )
         critique, prompt_tokens, completion_tokens, finish_reason = await _call(
@@ -255,8 +334,13 @@ async def generate_readme(
         # could in principle reintroduce the pattern while fixing
         # something else.
         structural_finding = check_file_enumeration(current, digest_file_count)
+        missing_files = (
+            find_nonexistent_file_references(current, real_paths, repository_root=repository_root)
+            if real_paths is not None
+            else []
+        )
 
-        if not llm_found_issues and structural_finding is None:
+        if not llm_found_issues and structural_finding is None and not missing_files:
             log.info("README Agent: critique round %d/%d found no issues", round_number, MAX_CRITIQUE_ROUNDS)
             break
 
@@ -269,6 +353,13 @@ async def generate_readme(
         # `critique` through as-is, keeps the noise out of both the log
         # line below and the revise prompt that reads `{critique}` next.
         bullets = dedupe_and_cap_bullets(critique, max_bullets=_MAX_CRITIQUE_ISSUES) if llm_found_issues else []
+        missing_bullets = [
+            f'[traceability] References a file or directory that does not exist in this repository: "{path}" — '
+            "replace with an actual path from the file digest or remove the reference."
+            for path in missing_files
+        ]
+        if missing_bullets:
+            bullets = [*missing_bullets, *bullets][:_MAX_CRITIQUE_ISSUES]
         if structural_finding is not None:
             # Lead with it: a structural finding calls for reorganizing
             # whole sections, which matters more than any single
@@ -288,12 +379,14 @@ async def generate_readme(
             critique,
         )
 
-        revise_prompt = render_prompt("readme_revise", draft=current, critique=critique)
-        current, prompt_tokens, completion_tokens, finish_reason = await _call(
-            provider, revise_prompt, temperature=0.2, max_tokens=4500
+        current, rev_tokens = await _revise_document(
+            current,
+            bullets,
+            structural_finding=structural_finding,
+            round_number=round_number,
+            provider=provider,
         )
-        total_tokens += (prompt_tokens or 0) + (completion_tokens or 0)
-        _warn_if_truncated(finish_reason, stage=f"revise (round {round_number})")
+        total_tokens += rev_tokens
         revision_count += 1
 
         # Re-run all three dedicated fixers after every revise, in case
@@ -349,29 +442,121 @@ def _strip_trailing_dividers(text: str) -> str:
             return stripped + "\n" if stripped else stripped
 
 
+_QUOTED_TARGET_RE = re.compile(r'"([^"\n]+)"')
+_BACKTICK_SPAN_RE = re.compile(r"`[^`\n]+`")
+_ABBREV_DOT_RE = re.compile(r"\b(?:e\.g|i\.e|etc|vs|dr|mr|ms|fig|no)\.", re.IGNORECASE)
+_DECIMAL_DOT_RE = re.compile(r"(?<=\d)\.(?=\d)")
+
+
+def _split_markdown_sections(text: str) -> list[str]:
+    """Split a Markdown document into its preamble plus each `## ` section, preserving exact text."""
+    return re.split(r"(?=\n## )", text)
+
+
+async def _revise_document(
+    current: str,
+    bullets: list[str],
+    *,
+    structural_finding: str | None,
+    round_number: int,
+    provider: BaseProvider,
+) -> tuple[str, int]:
+    """
+    Revise `current` using `readme_revise`. When there is no `[structure]`
+    finding and every bullet maps cleanly to a specific `## ` section, edit
+    only the affected section(s) rather than re-emitting the entire README.
+    """
+    if structural_finding is None:
+        sections = _split_markdown_sections(current)
+        if len(sections) >= 2:
+            section_bullets: dict[int, list[str]] = defaultdict(list)
+            all_mapped = True
+            for bullet in bullets:
+                match = _QUOTED_TARGET_RE.search(bullet)
+                target = match.group(1).lower() if match else ""
+                matched_indices = [i for i, sec in enumerate(sections) if target and target in sec.lower()]
+                if not matched_indices:
+                    all_mapped = False
+                    break
+                for idx in matched_indices:
+                    section_bullets[idx].append(bullet)
+
+            if all_mapped and section_bullets:
+                total_tokens = 0
+                for idx in sorted(section_bullets):
+                    sec_critique = "\n".join(f"- {b}" for b in section_bullets[idx])
+                    revise_prompt = render_prompt("readme_revise", draft=sections[idx].lstrip("\n"), critique=sec_critique)
+                    revised_sec, prompt_tokens, completion_tokens, finish_reason = await _call(
+                        provider, revise_prompt, temperature=0.2, max_tokens=2000
+                    )
+                    total_tokens += (prompt_tokens or 0) + (completion_tokens or 0)
+                    _warn_if_truncated(finish_reason, stage=f"revise section {idx} (round {round_number})")
+                    leading = "\n" if sections[idx].startswith("\n") else ""
+                    trailing = "\n" if sections[idx].endswith("\n") else ""
+                    sections[idx] = leading + revised_sec + trailing
+                return "".join(sections), total_tokens
+
+    critique = "\n".join(f"- {b}" for b in bullets)
+    revise_prompt = render_prompt("readme_revise", draft=current, critique=critique)
+    revised, prompt_tokens, completion_tokens, finish_reason = await _call(
+        provider, revise_prompt, temperature=0.2, max_tokens=4500
+    )
+    _warn_if_truncated(finish_reason, stage=f"revise (round {round_number})")
+    return revised, (prompt_tokens or 0) + (completion_tokens or 0)
+
+
+def _mask_non_sentence_dots(text: str) -> str:
+    """
+    Return a same-length copy of `text` where dots inside backtick spans,
+    common abbreviations (`e.g.`, `i.e.`, `etc.`, `vs.`), and decimals/versions
+    are replaced with spaces so sentence-boundary detection does not split on them.
+    """
+    chars = list(text)
+    for match in _BACKTICK_SPAN_RE.finditer(text):
+        for i in range(match.start(), match.end()):
+            if chars[i] in ".!?":
+                chars[i] = " "
+    for match in _ABBREV_DOT_RE.finditer(text):
+        for i in range(match.start(), match.end()):
+            if chars[i] == ".":
+                chars[i] = " "
+    for match in _DECIMAL_DOT_RE.finditer(text):
+        chars[match.start()] = " "
+    return "".join(chars)
+
+
 def _locate_sentence(text: str, phrase: str) -> tuple[int, int, str] | None:
     """Find the rough sentence boundaries around `phrase`'s first occurrence in `text`."""
     idx = text.lower().find(phrase.lower())
     if idx == -1:
         return None
 
+    masked = _mask_non_sentence_dots(text)
+
     start = 0
     for terminator in (". ", "! ", "? ", "\n"):
-        pos = text.rfind(terminator, 0, idx)
+        pos = masked.rfind(terminator, 0, idx)
         if pos != -1:
             start = max(start, pos + len(terminator))
 
     end = len(text)
     for terminator in (".", "!", "?"):
-        pos = text.find(terminator, idx)
-        if pos != -1:
-            end = min(end, pos + 1)
+        search_from = idx
+        while True:
+            pos = masked.find(terminator, search_from)
+            if pos == -1:
+                break
+            next_ch = masked[pos + 1] if pos + 1 < len(masked) else ""
+            if not next_ch or next_ch.isspace() or next_ch in "\"')":
+                end = min(end, pos + 1)
+                break
+            search_from = pos + 1
 
     # Fall back to a bare newline as the end boundary only if it comes
     # before any sentence-ending punctuation was found (e.g. bullet points
     # with no terminal punctuation) — the newline itself is never consumed
     # here, so it's preserved as leading whitespace in the caller's `tail`.
-    newline_pos = text.find("\n", idx)
+    newline_pos = masked.find("\n", idx)
     if newline_pos != -1:
         end = min(end, newline_pos)
 

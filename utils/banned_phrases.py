@@ -42,9 +42,17 @@ _BANNED_PHRASES: list[str] = [
     r"significantly improves? performance",
     r"robust and (?:reliable|scalable|maintainable)",
     r"seamless(?:ly)?",
+    r"plays? a (?:crucial|vital|pivotal|key|central|critical) role",
+    r"serves? as (?:the )?(?:backbone|cornerstone|linchpin)",
+    r"leverages? (?:the power of|modern|advanced)",
+    r"comprehensive suite of",
+    r"designed with (?:modularity|extensibility|scalability|flexibility|maintainability) in mind",
+    r"streamlines? (?:the )?(?:workflow|process|development)",
+    r"follows? (?:industry )?best practices",
 ]
 
 _COMPILED = [re.compile(pattern, re.IGNORECASE) for pattern in _BANNED_PHRASES]
+_DOUBLE_QUOTED_SPAN = re.compile(r'"[^"\n]+"')
 
 
 def find_banned_phrases(text: str) -> list[str]:
@@ -52,10 +60,17 @@ def find_banned_phrases(text: str) -> list[str]:
     Scan `text` and return the exact matched substrings (as they actually
     appear, preserving original casing/inflection) for every banned-phrase
     hit, in order of appearance. Empty list means clean.
+
+    Matches inside double-quoted spans (`"..."`) are skipped so summaries
+    that quote a banned phrase as an example (e.g. `banned_phrases.py`'s
+    own documentation) are not falsely flagged as using filler prose.
     """
+    quoted_ranges = [(m.start(), m.end()) for m in _DOUBLE_QUOTED_SPAN.finditer(text)]
     matches: list[str] = []
     for pattern in _COMPILED:
         for match in pattern.finditer(text):
+            if any(start <= match.start() and match.end() <= end for start, end in quoted_ranges):
+                continue
             matches.append(match.group(0))
     return matches
 
