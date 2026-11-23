@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from agents.api_agent import build_endpoint_digest, detect_endpoints, generate_api_reference
 from llm.base import BaseProvider, ChatMessage, GenerationResult, HealthStatus, ModelInfo, ProviderError
 from parsers.go_parser import parse_go_file
 from parsers.python_parser import parse_python_file
+from parsers.rust_parser import parse_rust_file
+from parsers.ts_parser import parse_typescript_file
 
 
 @pytest.fixture(autouse=True)
@@ -80,20 +84,69 @@ class TestDetectEndpoints:
         assert detect_endpoints({"api.py": parse_result}) == []
 
     def test_go_files_never_produce_candidates_decorators_not_supported(self) -> None:
-        # Real, documented limitation: only Python captures decorators at all.
+        # Plain Go functions without route registrations produce no candidates.
         src = b'package main\n\nfunc handler() {}\n'
         parse_result = parse_go_file("main.go", src)
         assert detect_endpoints({"main.go": parse_result}) == []
 
+    def test_detects_nextjs_app_router_endpoints(self) -> None:
+        src = b"export async function GET(req: Request): Promise<Response> { return new Response('ok'); }\n"
+        parse_result = parse_typescript_file("src/app/users/route.ts", src)
+        candidates = detect_endpoints({"src/app/users/route.ts": parse_result})
+        assert len(candidates) == 1
+        assert candidates[0].route_hint == "GET /users"
+
+    def test_detects_express_routes_from_source(self, tmp_path: Path) -> None:
+        src = 'function listUsers(req, res) { res.json([]); }\napp.get("/users", listUsers);\n'
+        (tmp_path / "routes.ts").write_text(src, encoding="utf-8")
+        parse_result = parse_typescript_file("routes.ts", src.encode("utf-8"))
+        candidates = detect_endpoints({"routes.ts": parse_result}, repository_root=tmp_path)
+        assert len(candidates) == 1
+        assert candidates[0].route_hint == "GET /users"
+        assert candidates[0].symbol.name == "listUsers"
+
+    def test_detects_go_gin_and_net_http_routes(self, tmp_path: Path) -> None:
+        src = (
+            'package main\n\n'
+            'func GetUser(c *gin.Context) {}\n'
+            'func Health(w http.ResponseWriter, r *http.Request) {}\n'
+            'func main() {\n'
+            '    r.GET("/users/:id", GetUser)\n'
+            '    http.HandleFunc("/health", Health)\n'
+            '}\n'
+        )
+        (tmp_path / "main.go").write_text(src, encoding="utf-8")
+        parse_result = parse_go_file("main.go", src.encode("utf-8"))
+        candidates = detect_endpoints({"main.go": parse_result}, repository_root=tmp_path)
+        hints = {c.route_hint for c in candidates}
+        assert "GET /users/:id" in hints
+        assert "HANDLE /health" in hints
+
+    def test_detects_rust_actix_and_axum_routes(self, tmp_path: Path) -> None:
+        src = (
+            '#[get("/items")]\n'
+            'async fn list_items() -> String { String::new() }\n'
+            'async fn create_item() {}\n'
+            'fn router() { app.route("/items", post(create_item)); }\n'
+        )
+        (tmp_path / "main.rs").write_text(src, encoding="utf-8")
+        parse_result = parse_rust_file("main.rs", src.encode("utf-8"))
+        candidates = detect_endpoints({"main.rs": parse_result}, repository_root=tmp_path)
+        hints = {c.route_hint for c in candidates}
+        assert "GET /items" in hints
+        assert "POST /items" in hints
+
 
 class TestBuildEndpointDigest:
-    def test_includes_signature_decorator_and_docstring(self) -> None:
+    def test_includes_signature_parameters_return_type_and_docstring(self) -> None:
         src = b'@app.get("/x")\ndef foo(y: int) -> bool:\n    """Does a thing."""\n    return True\n'
         parse_result = parse_python_file("api.py", src)
         candidates = detect_endpoints({"api.py": parse_result})
         digest = build_endpoint_digest(candidates)
         assert "@app.get" in digest
         assert "def foo(y: int) -> bool" in digest
+        assert "Parameters: y: int" in digest
+        assert "Return type: bool" in digest
         assert "Does a thing." in digest
 
     def test_missing_docstring_noted_not_invented(self) -> None:

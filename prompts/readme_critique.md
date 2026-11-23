@@ -15,6 +15,9 @@ Verified pipeline execution order (ground truth — the actual sequence stages r
 Verified license (ground truth for any License section or license claim in the draft):
 {license_summary}
 
+Verified setup, CLI commands, and environment variables (ground truth for Installation/Usage/Configuration claims):
+{setup_context}
+
 Draft README to check:
 <draft>
 {draft}

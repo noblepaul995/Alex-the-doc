@@ -13,30 +13,47 @@ which is the best available proof that the foundation actually works.
 from __future__ import annotations
 
 import asyncio
+import html as html_lib
 import os
 import shutil
 import stat
 import subprocess
+import sys
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Annotated
 
 import httpx
+import markdown as markdown_lib
 import typer
+from rich import box
 from rich.console import Console
-from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+from rich.live import Live
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn, TimeElapsedColumn
 from rich.prompt import Confirm, IntPrompt, Prompt
+from rich.rule import Rule
 from rich.table import Table
 
+from agents.api_agent import detect_endpoints
 from agents.export_agent import SUPPORTED_FORMATS, export_documentation
 from agents.qa_agent import investigate
+from exporters.html import build_search_index, ordered_doc_names, render_docs_page
+from tools.api_tester import build_test_plan, parse_kv_flags, run_test_plan
 from config.model_recommendations import recommend_tier
 from config.providers import PROVIDER_REGISTRY, ProviderType, resolve_provider_config, resolve_synthesis_provider_config
 from config.settings import Settings, get_settings
+from embeddings.embed import EmbeddingItem, embed_items
 from embeddings.lancedb import LanceVectorStore
+from embeddings.vector import RecordType
 from graph.graph import QA_GRAPH_NODE_COUNT, build_graph, build_qa_graph, build_scan_graph
 from graph.state import RepositoryState
 from llm.base import BaseProvider, ChatMessage, ProviderError, Role
 from llm.factory import create_provider
+from memory.repository import RepositoryMemory
+from retrieval.search import semantic_search
 from utils.github_repo import RepoAccessResult, check_repo_access, clone_repo, parse_github_url
 from utils.hardware_detect import HardwareInfo, detect_hardware
 from utils.logger import configure_logging, get_logger
@@ -96,10 +113,11 @@ async def _run_with_progress(
     earlier ones for the same key.
     """
     with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TextColumn("{task.completed}/{task.total}"),
+        SpinnerColumn(style="cyan"),
+        TextColumn("[bold cyan]{task.description}"),
+        BarColumn(bar_width=32, complete_style="cyan", finished_style="green"),
+        TaskProgressColumn(),
+        TextColumn("[dim]{task.completed}/{task.total}[/dim]"),
         TimeElapsedColumn(),
         console=console,
     ) as progress:
@@ -141,9 +159,259 @@ async def _run_with_progress(
 cli = typer.Typer(
     name="alex",
     help="AI Documentation Engine — understands and documents codebases of any size.",
-    no_args_is_help=True,
+    rich_markup_mode="rich",
 )
 log = get_logger(__name__)
+
+
+def _time_greeting(hour: int | None = None) -> str:
+    """Return a friendly time-of-day greeting based on local hour."""
+    h = datetime.now().hour if hour is None else hour
+    if 5 <= h < 12:
+        return "Good morning"
+    if 12 <= h < 17:
+        return "Good afternoon"
+    if 17 <= h < 21:
+        return "Good evening"
+    return "Good night"
+
+
+def _read_key() -> str:
+    """Read a single keypress (`up`, `down`, `enter`, `esc`, or character) cross-platform."""
+    if os.name == "nt":
+        import msvcrt
+
+        ch = msvcrt.getwch()
+        if ch in ("\x00", "\xe0"):
+            code = msvcrt.getwch()
+            return {"H": "up", "P": "down", "K": "left", "M": "right"}.get(code, "")
+        if ch in ("\r", "\n"):
+            return "enter"
+        if ch == "\x1b":
+            return "esc"
+        if ch == "\x03":
+            raise KeyboardInterrupt
+        return ch.lower()
+
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        if ch == "\x1b":
+            seq = sys.stdin.read(2)
+            return {"[A": "up", "[B": "down", "[C": "right", "[D": "left"}.get(seq, "esc")
+        if ch in ("\r", "\n"):
+            return "enter"
+        if ch == "\x03":
+            raise KeyboardInterrupt
+        return ch.lower()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def _select_menu_option(
+    options: list[tuple[str, str, str]],
+    *,
+    title: str = "What would you like to do?",
+    col_header: str = "Command",
+    default_index: int = 0,
+    cancel_value: str | None = "exit",
+) -> str:
+    """
+    Interactive arrow-key selector rendered with Rich `Live`.
+    Falls back to `Prompt.ask` when stdin is not a TTY.
+    """
+    if not sys.stdin.isatty():
+        menu = _styled_table(title)
+        menu.add_column("#", justify="right", style="cyan bold")
+        menu.add_column(col_header, style="bold")
+        menu.add_column("Description")
+        for num, name, desc in options:
+            menu.add_row(num, name, desc)
+        console.print(menu)
+        default_num = options[default_index][0] if 0 <= default_index < len(options) else options[0][0]
+        raw = Prompt.ask("Choose an option (number or name)", default=default_num).strip().lower()
+        aliases = {num: name for num, name, _ in options}
+        if cancel_value is not None:
+            aliases.update({"q": cancel_value, "quit": cancel_value})
+        return aliases.get(raw, raw)
+
+    idx = max(0, min(default_index, len(options) - 1))
+
+    def _render(selected: int) -> Panel:
+        table = Table(
+            box=None,
+            show_header=True,
+            header_style="bold cyan",
+            padding=(0, 1),
+            expand=True,
+        )
+        table.add_column("", width=2, no_wrap=True)
+        table.add_column(col_header, width=18, no_wrap=True)
+        table.add_column("Description")
+
+        for i, (_num, name, desc) in enumerate(options):
+            if i == selected:
+                table.add_row(
+                    "[bold cyan]❯[/bold cyan]",
+                    f"[bold black on cyan] {name} [/bold black on cyan]",
+                    f"[bold white]{desc}[/bold white]",
+                )
+            else:
+                table.add_row(" ", f"[cyan]{name}[/cyan]", f"[dim]{desc}[/dim]")
+
+        quick_hint = f"1-{len(options)}" if len(options) > 1 else "1"
+        return Panel(
+            table,
+            title=f"[bold white]{title}[/bold white]",
+            subtitle=f"[dim]↑/↓ move  •  Enter select  •  {quick_hint} quick pick  •  Esc/q cancel[/dim]",
+            border_style="bright_black",
+            box=box.ROUNDED,
+        )
+
+    number_map = {num: name for num, name, _ in options}
+
+    with Live(_render(idx), console=console, refresh_per_second=30, transient=True) as live:
+        while True:
+            try:
+                key = _read_key()
+            except KeyboardInterrupt:
+                if cancel_value is not None:
+                    return cancel_value
+                raise typer.Exit(code=0)
+            if key in ("up", "k"):
+                idx = (idx - 1) % len(options)
+                live.update(_render(idx))
+            elif key in ("down", "j"):
+                idx = (idx + 1) % len(options)
+                live.update(_render(idx))
+            elif key == "enter":
+                return options[idx][1]
+            elif key in ("esc", "q"):
+                if cancel_value is not None:
+                    return cancel_value
+                raise typer.Exit(code=0)
+            elif key in number_map:
+                return number_map[key]
+
+
+@cli.callback(invoke_without_command=True)
+def main(ctx: typer.Context) -> None:
+    """Interactive welcome launcher when `alex` is invoked with no subcommand."""
+    if ctx.invoked_subcommand is not None:
+        return
+
+    greeting = _time_greeting()
+    console.print()
+    console.print(
+        Panel(
+            f"[bold cyan]{greeting}![/bold cyan] Welcome to [bold white]alex[/bold white] — AI Documentation Engine.\n"
+            f"[dim]Workspace:[/dim] [cyan]{Path.cwd()}[/cyan]",
+            border_style="cyan",
+            box=box.ROUNDED,
+        )
+    )
+
+    options = [
+        ("1", "scan", "Walk the repository and preview tracked files (offline)"),
+        ("2", "document", "Run the full documentation pipeline"),
+        ("3", "export", "Document and export to Markdown, HTML, PDF, or JSON"),
+        ("4", "update", "Incrementally re-document only changed files"),
+        ("5", "search", "Semantic search over indexed code summaries"),
+        ("6", "serve", "Serve generated documentation in a local web UI"),
+        ("7", "api-test", "Smoke-test discovered HTTP endpoints against a live server"),
+        ("8", "github", "Clone a GitHub repo to document or run Q&A"),
+        ("9", "stats", "Show cached file, doc, and vector index statistics"),
+        ("10", "doctor", "Check LLM provider connectivity & auth"),
+        ("11", "setup", "Interactive first-run provider & model setup"),
+        ("12", "rebuild-index", "Rebuild vector index from cached summaries"),
+        ("13", "clear-cache", "Clear cached file hashes, parses, and summaries"),
+        ("0", "exit", "Exit alex"),
+    ]
+    selected = _select_menu_option(options)
+
+    if selected == "exit":
+        return
+    if selected == "scan":
+        target = Path(Prompt.ask("Repository path", default="."))
+        scan(path=target)
+    elif selected == "document":
+        target = Path(Prompt.ask("Repository path", default="."))
+        document(path=target)
+    elif selected == "export":
+        target = Path(Prompt.ask("Repository path", default="."))
+        fmt = Prompt.ask("Format(s) (markdown,html,pdf,json)", default="markdown")
+        out_raw = Prompt.ask("Output directory (leave blank for default)", default="").strip()
+        export(path=target, fmt=fmt, output=Path(out_raw) if out_raw else None)
+    elif selected == "update":
+        target = Path(Prompt.ask("Repository path", default="."))
+        update(path=target)
+    elif selected == "search":
+        q = Prompt.ask("Search query").strip()
+        if q:
+            search(query=q)
+    elif selected == "serve":
+        port_raw = Prompt.ask("Port", default="8420").strip()
+        serve(port=int(port_raw) if port_raw.isdigit() else 8420)
+    elif selected == "api-test":
+        target = Path(Prompt.ask("Repository path", default="."))
+        base_url = Prompt.ask("Server base URL", default="http://localhost:8000").strip()
+        api_test(path=target, url=base_url)
+    elif selected == "github":
+        repo_arg = Prompt.ask("GitHub repo (owner/repo or URL)").strip()
+        if repo_arg:
+            github(repo=repo_arg)
+    elif selected == "stats":
+        stats()
+    elif selected == "doctor":
+        doctor()
+    elif selected == "setup":
+        setup()
+    elif selected == "rebuild-index":
+        rebuild_index()
+    elif selected == "clear-cache":
+        clear_cache()
+    else:
+        console.print(f"[red]Unknown option:[/red] {selected!r}. Run [cyan]alex --help[/cyan] to see all commands.")
+        raise typer.Exit(code=1)
+
+
+def _print_banner(command: str, subtitle: str | None = None) -> None:
+    """Render a clean, consistent header rule for CLI commands."""
+    title = f"[bold cyan]alex[/bold cyan] [bold white]{command}[/bold white]"
+    if subtitle:
+        title += f" [dim]— {subtitle}[/dim]"
+    console.print()
+    console.print(Rule(title, style="bright_black", align="left"))
+
+
+def _styled_table(title: str | None = None, *, show_lines: bool = False) -> Table:
+    """Build a Rich Table with consistent rounded borders and header styling."""
+    return Table(
+        title=title,
+        box=box.ROUNDED,
+        border_style="bright_black",
+        header_style="bold cyan",
+        title_style="bold white",
+        show_lines=show_lines,
+    )
+
+
+def _print_errors(errors: list[object], title: str = "Errors during run") -> None:
+    """Render deduplicated pipeline errors inside a red-bordered panel."""
+    seen: set[str] = set()
+    lines: list[str] = []
+    for error in errors:
+        message = error.message if hasattr(error, "message") else str(error)
+        if message not in seen:
+            seen.add(message)
+            lines.append(f"• {message}")
+    if lines:
+        console.print(Panel("\n".join(lines), title=f"[bold red]{title}[/bold red]", border_style="red", box=box.ROUNDED))
 
 
 def _setup(verbose: bool = False) -> None:
@@ -178,36 +446,29 @@ def scan(
 ) -> None:
     """Walk the repository and report what would be scanned."""
     _setup(verbose)
+    _print_banner("scan", str(path.resolve()))
     graph = build_scan_graph()
     result = graph.invoke(RepositoryState(repository_path=path.resolve()))
 
     if result.get("errors"):
-        console.print("[red]Errors during scan:[/red]")
-        seen_messages: set[str] = set()
-        for error in result["errors"]:
-            message = error.message if hasattr(error, "message") else str(error)
-            if message in seen_messages:
-                continue
-            seen_messages.add(message)
-            console.print(f"  - {message}")
+        _print_errors(result["errors"], title="Errors during scan")
         if not result.get("file_metadata"):
             raise typer.Exit(code=1)
 
     file_metadata = result.get("file_metadata", {})
     stats = result.get("statistics")
 
-    console.print(f"[bold]Scanned[/bold] [cyan]{path.resolve()}[/cyan]")
-    console.print(
-        f"  {len(file_metadata)} files tracked, {stats.files_skipped if stats else 0} skipped "
-        f"(binary/ignored)"
-    )
+    summary_lines = [
+        f"[bold]Repository:[/bold] [cyan]{path.resolve()}[/cyan]",
+        f"[bold]Tracked:[/bold] {len(file_metadata)} file(s)   [bold]Skipped:[/bold] {stats.files_skipped if stats else 0} (binary/ignored)",
+    ]
     if stats:
-        console.print(f"  {stats.files_changed} file(s) changed since last run (Memory System)")
+        summary_lines.append(f"[bold]Changed since last run:[/bold] {stats.files_changed} file(s)")
     if stats and stats.files_skipped_secret:
-        console.print(
-            f"  [yellow]{stats.files_skipped_secret} file(s) skipped as likely secrets[/yellow] "
-            f"(.env, keys, credentials, ...) — never read or documented, regardless of .gitignore"
+        summary_lines.append(
+            f"[yellow]Secrets skipped:[/yellow] {stats.files_skipped_secret} file(s) (.env, keys, credentials — never read)"
         )
+    console.print(Panel("\n".join(summary_lines), title="Scan Summary", border_style="cyan", box=box.ROUNDED))
 
     if not file_metadata:
         console.print("[yellow]No trackable files found.[/yellow]")
@@ -218,19 +479,19 @@ def scan(
         key = project_file.language or "unknown"
         by_language[key] = by_language.get(key, 0) + 1
 
-    table = Table(title="Files by language")
-    table.add_column("Language")
-    table.add_column("Count", justify="right")
+    table = _styled_table("Files by language")
+    table.add_column("Language", style="cyan")
+    table.add_column("Count", justify="right", style="bold")
     for language, count in sorted(by_language.items(), key=lambda kv: -kv[1]):
         table.add_row(language, str(count))
     console.print(table)
 
     if verbose:
-        file_table = Table(title="Files")
+        file_table = _styled_table("Files")
         file_table.add_column("Path")
-        file_table.add_column("Language")
+        file_table.add_column("Language", style="cyan")
         file_table.add_column("Size", justify="right")
-        file_table.add_column("SHA256 (first 12)")
+        file_table.add_column("SHA256 (first 12)", style="dim")
         for relative_path in sorted(file_metadata):
             f = file_metadata[relative_path]
             table_hash = (f.content_hash or "")[:12]
@@ -252,25 +513,19 @@ def document(
     as they're implemented — it always runs the full graph end to end.
     """
     _setup(verbose)
+    _print_banner("document", str(path.resolve()))
     if provider or model:
         console.print(
             "[yellow]--provider/--model overrides aren't wired to the graph yet[/yellow] "
             "(resolve_provider_config() currently reads only from settings/env); "
-            f"running with the configured default instead."
+            "running with the configured default instead."
         )
 
     graph = build_graph()
     result = asyncio.run(_run_with_progress(graph, RepositoryState(repository_path=path.resolve())))
 
     if result.get("errors"):
-        console.print("[red]Errors during run:[/red]")
-        seen_messages: set[str] = set()
-        for error in result["errors"]:
-            message = error.message if hasattr(error, "message") else str(error)
-            if message in seen_messages:
-                continue
-            seen_messages.add(message)
-            console.print(f"  - {message}")
+        _print_errors(result["errors"])
 
     chunk_docs = result.get("chunk_docs")
     docs = chunk_docs.docs if chunk_docs else []
@@ -279,15 +534,17 @@ def document(
         return
 
     stats = result.get("statistics")
-    console.print(f"[bold]Documented[/bold] [cyan]{path.resolve()}[/cyan]")
-    console.print(
-        f"  {len([d for d in docs if not d.error])}/{len(docs)} chunk(s) documented"
-        + (f", {stats.tokens_used} token(s) used" if stats else "")
-    )
+    ok_chunks = len([d for d in docs if not d.error])
+    doc_summary = [
+        f"[bold]Repository:[/bold] [cyan]{path.resolve()}[/cyan]",
+        f"[bold]Chunks documented:[/bold] {ok_chunks}/{len(docs)}"
+        + (f"   [bold]Tokens used:[/bold] {stats.tokens_used:,}" if stats else ""),
+    ]
+    console.print(Panel("\n".join(doc_summary), title="Run Summary", border_style="green", box=box.ROUNDED))
 
-    table = Table(title="Chunk summaries")
-    table.add_column("File")
-    table.add_column("Lines")
+    table = _styled_table("Chunk summaries")
+    table.add_column("File", style="cyan")
+    table.add_column("Lines", justify="right", style="dim")
     table.add_column("Summary")
     for doc in docs:
         if doc.error:
@@ -300,8 +557,8 @@ def document(
     file_docs = result.get("file_docs")
     file_doc_list = file_docs.docs if file_docs else []
     if file_doc_list:
-        file_table = Table(title="File summaries")
-        file_table.add_column("File")
+        file_table = _styled_table("File summaries")
+        file_table.add_column("File", style="cyan")
         file_table.add_column("Summary")
         for doc in file_doc_list:
             if doc.error:
@@ -311,21 +568,26 @@ def document(
 
     repo_summary = result.get("repo_summary")
     if repo_summary:
-        console.print(f"\n[bold]Repository summary:[/bold]\n{repo_summary}\n")
+        console.print(Panel(repo_summary, title="Repository Summary", border_style="cyan", box=box.ROUNDED))
 
     generated_docs = result.get("generated_docs") or {}
-    for name, doc_text in generated_docs.items():
-        console.print(f"[bold]Generated {name}[/bold] ({len(doc_text)} chars) — full text written to state.generated_docs[{name!r}]")
+    if generated_docs:
+        gen_table = _styled_table("Generated documents")
+        gen_table.add_column("Document", style="cyan")
+        gen_table.add_column("Size", justify="right")
+        for name, doc_text in generated_docs.items():
+            gen_table.add_row(name, f"{len(doc_text):,} chars")
+        console.print(gen_table)
 
     review = result.get("review")
     if review and review.results:
-        review_table = Table(title="Review findings")
-        review_table.add_column("Document")
+        review_table = _styled_table("Review findings")
+        review_table.add_column("Document", style="cyan")
         review_table.add_column("Status")
         review_table.add_column("Issues")
         for r in review.results:
-            status = "[green]PASS[/green]" if r.passed else "[red]ISSUES[/red]"
-            issues = "; ".join(r.issues) if r.issues else "-"
+            status = "[green]● PASS[/green]" if r.passed else "[red]✖ ISSUES[/red]"
+            issues = "; ".join(r.issues) if r.issues else "[dim]-[/dim]"
             review_table.add_row(r.doc_name, status, issues)
         console.print(review_table)
 
@@ -333,31 +595,184 @@ def document(
 @cli.command()
 def update(
     path: Annotated[Path, typer.Argument(help="Repository path to incrementally update.")] = Path("."),
+    fmt: Annotated[str, typer.Option("--format", help="Comma-separated: markdown, html, pdf, json")] = "markdown",
+    output: Annotated[Path | None, typer.Option("--output", "-o", help="Output directory. Defaults to ALEX_DOCS_DIR.")] = None,
+    force: Annotated[bool, typer.Option("--force", help="Re-run even if zero files changed.")] = False,
     verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
 ) -> None:
-    """Regenerate documentation only for changed files (Memory System — not yet implemented)."""
+    """Incrementally re-document changed files using the Memory System and export updated docs."""
     _setup(verbose)
-    console.print("[yellow]Incremental update not yet implemented.[/yellow] Requires the Memory System stage.")
+    repo_path = path.resolve()
+    _print_banner("update", str(repo_path))
+
+    formats = [f.strip().lower() for f in fmt.split(",") if f.strip()]
+    unknown = set(formats) - SUPPORTED_FORMATS
+    if unknown:
+        console.print(f"[red]Unknown format(s): {sorted(unknown)}. Supported: {sorted(SUPPORTED_FORMATS)}[/red]")
+        raise typer.Exit(code=1)
+
+    settings = get_settings()
+    output_dir = output or settings.docs_dir
+
+    if not force:
+        scan_result = build_scan_graph().invoke(RepositoryState(repository_path=repo_path))
+        scan_stats = scan_result.get("statistics")
+        if scan_stats and scan_stats.files_changed == 0 and output_dir.exists() and any(output_dir.glob("*.md")):
+            console.print(
+                Panel(
+                    f"[green]Everything is up to date[/green] — 0 of {scan_stats.files_total} file(s) changed since last run.\n"
+                    "[dim]Pass --force to regenerate docs anyway.[/dim]",
+                    title="Incremental Update",
+                    border_style="green",
+                    box=box.ROUNDED,
+                )
+            )
+            return
+
+    graph = build_graph()
+    result = asyncio.run(_run_with_progress(graph, RepositoryState(repository_path=repo_path)))
+
+    if result.get("errors"):
+        _print_errors(result["errors"])
+
+    state = RepositoryState(**result)
+    written = export_documentation(state, formats, output_dir)
+
+    export_table = _styled_table(f"Updated docs in {output_dir.resolve()}")
+    export_table.add_column("Format", style="cyan")
+    export_table.add_column("Output Path")
+    for format_name, paths in written.items():
+        for p in paths:
+            export_table.add_row(format_name, str(p))
+    console.print()
+    console.print(export_table)
 
 
 @cli.command()
 def search(
     query: Annotated[str, typer.Argument(help="Natural-language search query.")],
+    limit: Annotated[int, typer.Option("--limit", "-n", help="Maximum results to display.")] = 8,
+    kind: Annotated[str | None, typer.Option("--type", "-t", help="Filter by record type: file or chunk.")] = None,
     verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
 ) -> None:
-    """Semantic search over documented code (Retrieval stage — not yet implemented)."""
+    """Semantic search over documented code summaries in the local vector store."""
     _setup(verbose)
-    console.print(f"[yellow]Search not yet implemented.[/yellow] Query received: [cyan]{query}[/cyan]")
+    _print_banner("search", query)
+    settings = get_settings()
+
+    record_type: RecordType | None = None
+    if kind is not None:
+        normalized = kind.strip().lower()
+        if normalized not in ("file", "chunk"):
+            console.print("[red]Invalid --type.[/red] Use 'file' or 'chunk'.")
+            raise typer.Exit(code=1)
+        record_type = RecordType.FILE if normalized == "file" else RecordType.CHUNK
+
+    async def _run_search():
+        config = resolve_provider_config(settings=settings)
+        async with create_provider(config) as provider:
+            return await semantic_search(query, settings.vector_dir, provider, limit=limit, record_type=record_type)
+
+    try:
+        results = asyncio.run(_run_search())
+    except ProviderError as exc:
+        console.print(f"[red]Search failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    if not results:
+        console.print(
+            "[yellow]No matching results found[/yellow] (or the vector index is empty — "
+            "run [cyan]alex document .[/cyan] or [cyan]alex export .[/cyan] first)."
+        )
+        return
+
+    table = _styled_table(f"Top {len(results)} result(s)")
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("Type", style="magenta")
+    table.add_column("File", style="cyan")
+    table.add_column("Distance", justify="right", style="dim")
+    table.add_column("Summary")
+    for i, item in enumerate(results, start=1):
+        summary_preview = item.text if len(item.text) <= 180 else item.text[:177] + "..."
+        table.add_row(str(i), item.record_type.value, item.file_path, f"{item.distance:.3f}", summary_preview)
+    console.print(table)
+
+
+def _render_serve_page(doc_name: str, docs: dict[str, Path]) -> str:
+    """Render one Markdown file from `docs` using the shared documentation HTML shell."""
+    all_texts = {name: path.read_text(encoding="utf-8", errors="replace") for name, path in docs.items()}
+    nav_items = [(name, f"/{name}") for name in docs]
+    search_index = build_search_index(all_texts, url_pattern="/{name}")
+    return render_docs_page(
+        doc_name,
+        all_texts[doc_name],
+        nav_items=nav_items,
+        active_name=doc_name,
+        search_index=search_index,
+    )
 
 
 @cli.command()
 def serve(
     port: Annotated[int, typer.Option(help="Port to serve documentation on.")] = 8420,
+    docs_dir: Annotated[Path | None, typer.Option("--dir", "-d", help="Directory containing generated Markdown docs.")] = None,
     verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
 ) -> None:
-    """Serve generated documentation locally (Export stage — not yet implemented)."""
+    """Serve generated documentation locally with a navigation sidebar."""
     _setup(verbose)
-    console.print(f"[yellow]Serve not yet implemented.[/yellow] Would serve docs on port {port}.")
+    settings = get_settings()
+    target_dir = (docs_dir or settings.docs_dir).resolve()
+    _print_banner("serve", f"{target_dir} on port {port}")
+
+    if not target_dir.is_dir():
+        console.print(f"[red]Directory not found:[/red] {target_dir}. Run [cyan]alex export .[/cyan] first.")
+        raise typer.Exit(code=1)
+
+    found = {p.stem: p for p in sorted(target_dir.glob("*.md"))}
+    if not found:
+        console.print(f"[yellow]No Markdown files found in {target_dir}.[/yellow]")
+        raise typer.Exit(code=1)
+
+    ordered = {name: found[name] for name in ordered_doc_names(list(found.keys()))}
+    default_doc = next(iter(ordered))
+
+    class _DocsHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler naming
+            slug = self.path.split("?", 1)[0].strip("/")
+            if not slug:
+                slug = default_doc
+            if slug.endswith(".md"):
+                slug = slug[:-3]
+            if slug not in ordered:
+                self.send_error(404, f"Document not found: {slug}")
+                return
+            html_bytes = _render_serve_page(slug, ordered).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html_bytes)))
+            self.end_headers()
+            self.wfile.write(html_bytes)
+
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+            log.debug("serve: " + format, *args)
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), _DocsHandler)
+    console.print(
+        Panel(
+            f"[bold]Serving {len(ordered)} document(s)[/bold] from [cyan]{target_dir}[/cyan]\n"
+            f"[bold]URL:[/bold] [link=http://127.0.0.1:{port}]http://127.0.0.1:{port}[/link]\n"
+            "[dim]Press Ctrl+C to stop.[/dim]",
+            title="alex serve",
+            border_style="cyan",
+            box=box.ROUNDED,
+        )
+    )
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        console.print("\n[dim]Server stopped.[/dim]")
+    finally:
+        server.server_close()
 
 
 @cli.command()
@@ -369,6 +784,7 @@ def export(
 ) -> None:
     """Run the full documentation pipeline and export the results to disk in the given format(s)."""
     _setup(verbose)
+    _print_banner("export", f"{path.resolve()} ({fmt})")
     formats = [f.strip().lower() for f in fmt.split(",") if f.strip()]
     unknown = set(formats) - SUPPORTED_FORMATS
     if unknown:
@@ -382,25 +798,118 @@ def export(
     result = asyncio.run(_run_with_progress(graph, RepositoryState(repository_path=path.resolve())))
 
     if result.get("errors"):
-        console.print("[red]Errors during run:[/red]")
-        seen_messages: set[str] = set()
-        for error in result["errors"]:
-            message = error.message if hasattr(error, "message") else str(error)
-            if message in seen_messages:
-                continue
-            seen_messages.add(message)
-            console.print(f"  - {message}")
+        _print_errors(result["errors"])
 
     state = RepositoryState(**result)
     written = export_documentation(state, formats, output_dir)
 
-    console.print(f"\n[bold]Exported to[/bold] [cyan]{output_dir.resolve()}[/cyan]")
+    export_table = _styled_table(f"Exported to {output_dir.resolve()}")
+    export_table.add_column("Format", style="cyan")
+    export_table.add_column("Output Path")
     for format_name, paths in written.items():
         if not paths:
-            console.print(f"  {format_name}: nothing to write")
+            export_table.add_row(format_name, "[dim]nothing to write[/dim]")
             continue
         for p in paths:
-            console.print(f"  {format_name}: {p}")
+            export_table.add_row(format_name, str(p))
+    console.print()
+    console.print(export_table)
+
+
+@cli.command(name="api-test")
+def api_test(
+    path: Annotated[Path, typer.Argument(help="Repository path to discover HTTP endpoints from.")] = Path("."),
+    url: Annotated[str, typer.Option("--url", "-u", help="Base URL of the running server, e.g. http://localhost:8000")] = "http://localhost:8000",
+    include_writes: Annotated[bool, typer.Option("--include-writes", help="Also execute non-GET/HEAD methods (POST, PUT, PATCH, DELETE).")] = False,
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="Preview planned requests without sending HTTP traffic.")] = False,
+    param: Annotated[list[str], typer.Option("--param", "-p", help="Path parameter substitution as key=value (repeatable).")] = [],
+    header: Annotated[list[str], typer.Option("--header", "-H", help="Extra HTTP header as 'Key: Value' (repeatable).")] = [],
+    timeout: Annotated[float, typer.Option("--timeout", help="Per-request timeout in seconds.")] = 10.0,
+    verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
+) -> None:
+    """Discover HTTP endpoints in a repository and smoke-test them against a live server."""
+    _setup(verbose)
+    repo_path = path.resolve()
+    _print_banner("api-test", f"{repo_path} -> {url}")
+
+    try:
+        param_map = parse_kv_flags(list(param), sep="=", label="--param")
+        header_map = parse_kv_flags(list(header), sep=":", label="--header")
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    scan_result = build_scan_graph().invoke(RepositoryState(repository_path=repo_path))
+    parse_results = scan_result.get("parse_results") or {}
+    candidates = detect_endpoints(parse_results, repository_root=repo_path)
+
+    if not candidates:
+        console.print("[yellow]No HTTP endpoints detected in this repository.[/yellow]")
+        return
+
+    plan = build_test_plan(candidates, include_writes=include_writes, params=param_map)
+    if not plan:
+        console.print("[yellow]No testable HTTP routes could be extracted from detected endpoints.[/yellow]")
+        return
+
+    if dry_run:
+        plan_table = _styled_table(f"Dry-run plan ({len(plan)} route(s))")
+        plan_table.add_column("Method", style="bold cyan")
+        plan_table.add_column("Route")
+        plan_table.add_column("Target Path", style="cyan")
+        plan_table.add_column("Status")
+        plan_table.add_column("Note", style="dim")
+        for case in plan:
+            status_badge = "[green]READY[/green]" if case.status == "PENDING" else "[yellow]SKIPPED[/yellow]"
+            plan_table.add_row(
+                case.method,
+                case.route_template,
+                case.resolved_path or "-",
+                status_badge,
+                case.skip_reason or case.source,
+            )
+        console.print(plan_table)
+        return
+
+    results = asyncio.run(run_test_plan(plan, url, headers=header_map, timeout=timeout))
+
+    res_table = _styled_table(f"API Smoke Test Results ({url})")
+    res_table.add_column("Method", style="bold cyan")
+    res_table.add_column("Route")
+    res_table.add_column("Status", justify="right")
+    res_table.add_column("Latency", justify="right")
+    res_table.add_column("Result")
+    res_table.add_column("Detail", style="dim")
+
+    passed = failed = skipped = 0
+    for r in results:
+        if r.outcome == "PASS":
+            passed += 1
+            badge = "[green]● PASS[/green]"
+        elif r.outcome == "SKIPPED":
+            skipped += 1
+            badge = "[yellow]○ SKIPPED[/yellow]"
+        else:
+            failed += 1
+            badge = f"[red]✖ {r.outcome}[/red]"
+
+        status_str = str(r.status_code) if r.status_code is not None else "-"
+        latency_str = f"{r.latency_ms:.0f} ms" if r.latency_ms is not None else "-"
+        route_display = r.case.resolved_path or r.case.route_template
+        res_table.add_row(r.case.method, route_display, status_str, latency_str, badge, r.detail)
+
+    console.print(res_table)
+    border = "green" if failed == 0 else "red"
+    console.print(
+        Panel(
+            f"[green]Passed:[/green] {passed}   [red]Failed/Errors:[/red] {failed}   [yellow]Skipped:[/yellow] {skipped}",
+            title="Summary",
+            border_style=border,
+            box=box.ROUNDED,
+        )
+    )
+    if failed > 0:
+        raise typer.Exit(code=1)
 
 
 @cli.command(name="clear-cache")
@@ -418,16 +927,116 @@ def clear_cache(verbose: Annotated[bool, typer.Option("--verbose", "-v")] = Fals
 
 @cli.command(name="rebuild-index")
 def rebuild_index(verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False) -> None:
-    """Rebuild the vector index from stored summaries (Vector Database stage — not yet implemented)."""
+    """Rebuild the LanceDB vector index from cached SQLite summaries without re-running LLM calls."""
     _setup(verbose)
-    console.print("[yellow]Index rebuild not yet implemented.[/yellow] Requires the Vector Database stage.")
+    _print_banner("rebuild-index", "Re-embedding cached summaries into LanceDB")
+    settings = get_settings()
+
+    if not settings.db_path.exists():
+        console.print(f"[yellow]No cache database found at {settings.db_path}.[/yellow] Run [cyan]alex document .[/cyan] first.")
+        raise typer.Exit(code=1)
+
+    memory = RepositoryMemory(settings.db_path)
+    chunk_docs, file_docs = memory.load_all_cached_docs()
+    if not chunk_docs and not file_docs:
+        console.print("[yellow]No cached chunk or file summaries found to index.[/yellow]")
+        return
+
+    items: list[EmbeddingItem] = [
+        EmbeddingItem(
+            id=f"chunk:{d.chunk_id}",
+            record_type=RecordType.CHUNK,
+            file_path=d.file_path,
+            text=d.summary,
+        )
+        for d in chunk_docs
+    ]
+    items.extend(
+        EmbeddingItem(
+            id=f"file:{d.file_path}",
+            record_type=RecordType.FILE,
+            file_path=d.file_path,
+            text=d.summary,
+        )
+        for d in file_docs
+    )
+
+    async def _rebuild() -> tuple[int, int]:
+        config = resolve_provider_config(settings=settings)
+        async with create_provider(config) as provider:
+            collection = await embed_items(
+                items, provider, batch_size=settings.embedding_batch_size, max_concurrency=settings.max_concurrent_requests
+            )
+        valid = [r for r in collection.records if r.error is None and r.vector]
+        store = await LanceVectorStore.connect(settings.vector_dir)
+        written = await store.write_records(valid)
+        return written, len(collection.failed())
+
+    try:
+        written, failed = asyncio.run(_rebuild())
+    except ProviderError as exc:
+        console.print(f"[red]Rebuild failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(
+        Panel(
+            f"[green]Rebuilt vector index[/green] at [cyan]{settings.vector_dir}[/cyan]\n"
+            f"[bold]Indexed:[/bold] {written} vector(s) ({len(chunk_docs)} chunk, {len(file_docs)} file)"
+            + (f"   [yellow]Failed:[/yellow] {failed}" if failed else ""),
+            title="Index Rebuilt",
+            border_style="green",
+            box=box.ROUNDED,
+        )
+    )
+
+
+def _dir_size_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+    if path.is_file():
+        return path.stat().st_size
+    return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
+
+
+def _format_bytes(num_bytes: int) -> str:
+    if num_bytes < 1024:
+        return f"{num_bytes} B"
+    if num_bytes < 1024 * 1024:
+        return f"{num_bytes / 1024:.1f} KB"
+    return f"{num_bytes / (1024 * 1024):.2f} MB"
 
 
 @cli.command()
 def stats(verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False) -> None:
-    """Show statistics about the last run (Memory System — not yet implemented)."""
+    """Show cached file, summary, and vector store statistics."""
     _setup(verbose)
-    console.print("[yellow]Stats not yet implemented.[/yellow] Requires the Memory System stage.")
+    _print_banner("stats", "Memory & vector store metrics")
+    settings = get_settings()
+
+    counts: dict[str, int] = {}
+    if settings.db_path.exists():
+        counts = RepositoryMemory(settings.db_path).get_stats()
+
+    async def _vector_count() -> int:
+        if not settings.vector_dir.exists():
+            return 0
+        store = await LanceVectorStore.connect(settings.vector_dir)
+        return await store.count()
+
+    vec_count = asyncio.run(_vector_count())
+
+    table = _styled_table("Storage & Cache Statistics")
+    table.add_column("Metric", style="bold")
+    table.add_column("Value", justify="right", style="cyan")
+    table.add_column("Location", style="dim")
+    table.add_row("Tracked file hashes", str(counts.get("file_hash", 0)), str(settings.db_path))
+    table.add_row("Cached parse results", str(counts.get("parse_result", 0)), str(settings.db_path))
+    table.add_row("Cached chunk doc sets", str(counts.get("chunk_docs", 0)), str(settings.db_path))
+    table.add_row("Cached file docs", str(counts.get("file_doc", 0)), str(settings.db_path))
+    table.add_row("SQLite database size", _format_bytes(_dir_size_bytes(settings.db_path)), str(settings.db_path))
+    table.add_row("Indexed vectors", str(vec_count), str(settings.vector_dir))
+    table.add_row("Vector store size", _format_bytes(_dir_size_bytes(settings.vector_dir)), str(settings.vector_dir))
+    console.print(table)
 
 
 @cli.command()
@@ -438,16 +1047,17 @@ def doctor(
 ) -> None:
     """Check provider connectivity/auth. Fully functional today — validates the foundation."""
     _setup(verbose)
+    _print_banner("doctor", "Provider connectivity & auth")
     settings = get_settings()
 
     targets = [ProviderType(provider)] if provider else list(PROVIDER_REGISTRY.keys())
 
-    table = Table(title="alex doctor")
-    table.add_column("Provider")
-    table.add_column("Model")
+    table = _styled_table()
+    table.add_column("Provider", style="bold")
+    table.add_column("Model", style="cyan")
     table.add_column("Status")
-    table.add_column("Latency")
-    table.add_column("Detail")
+    table.add_column("Latency", justify="right")
+    table.add_column("Detail", style="dim")
 
     async def check_all() -> None:
         for provider_type in targets:
@@ -457,7 +1067,7 @@ def doctor(
                 # a misleading failure.
                 config_probe = resolve_provider_config(provider=provider_type.value, model=model or "probe", settings=settings)
                 if not config_probe.api_key:
-                    table.add_row(entry.name, "-", "[dim]skipped (no API key)[/dim]", "-", "")
+                    table.add_row(entry.name, "-", "[dim]○ skipped (no API key)[/dim]", "-", "")
                     continue
 
             config = resolve_provider_config(provider=provider_type.value, model=model, settings=settings)
@@ -465,10 +1075,10 @@ def doctor(
                 async with create_provider(config) as client:
                     status = await client.health()
             except ProviderError as exc:
-                table.add_row(entry.name, config.model, "[red]error[/red]", "-", str(exc))
+                table.add_row(entry.name, config.model, "[red]✖ error[/red]", "-", str(exc))
                 continue
 
-            status_label = "[green]healthy[/green]" if status.healthy else "[red]unhealthy[/red]"
+            status_label = "[green]● healthy[/green]" if status.healthy else "[red]● unhealthy[/red]"
             latency = f"{status.latency_ms:.0f} ms" if status.latency_ms is not None else "-"
             table.add_row(entry.name, status.model, status_label, latency, status.detail)
 
@@ -589,32 +1199,39 @@ def setup(verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False) -> 
     one via Ollama, and verify it works with a real test call.
     """
     _setup(verbose)
+    _print_banner("setup", "Interactive provider configuration")
     settings = get_settings()
 
-    console.print("[bold]alex setup[/bold]\n")
     console.print("Checking which providers are already usable...\n")
     availability = asyncio.run(_check_provider_availability(settings))
 
-    table = Table(title="Providers")
-    table.add_column("Provider")
+    table = _styled_table("Providers")
+    table.add_column("Provider", style="bold")
     table.add_column("Status")
-    table.add_column("Detail")
+    table.add_column("Detail", style="dim")
     for provider_type, (ok, detail) in availability.items():
         entry = PROVIDER_REGISTRY[provider_type]
-        status = "[green]available[/green]" if ok else "[dim]not configured[/dim]"
+        status = "[green]● available[/green]" if ok else "[dim]○ not configured[/dim]"
         table.add_row(entry.name, status, detail)
     console.print(table)
 
     available_types = [pt for pt, (ok, _detail) in availability.items() if ok]
     console.print()
-    choices = [pt.value for pt in availability] + ["local"]
-    default_choice = available_types[0].value if available_types else "local"
-    picked = Prompt.ask(
-        "Which provider would you like to use? (pick one already available, name any other to configure it, "
-        "or 'local' for a guided local-model setup)",
-        choices=choices,
-        default=default_choice,
-        show_choices=False,
+    provider_options: list[tuple[str, str, str]] = []
+    for i, (pt, (ok, detail)) in enumerate(availability.items(), start=1):
+        badge = "available" if ok else detail
+        provider_options.append((str(i), pt.value, f"{PROVIDER_REGISTRY[pt].name} ({badge})"))
+    provider_options.append((str(len(provider_options) + 1), "local", "Guided local-model setup with Ollama"))
+
+    default_provider_idx = (
+        next((i for i, pt in enumerate(availability) if pt in available_types), len(provider_options) - 1)
+    )
+    picked = _select_menu_option(
+        provider_options,
+        title="Choose a provider",
+        col_header="Provider",
+        default_index=default_provider_idx,
+        cancel_value=None,
     )
 
     if picked != "local":
@@ -651,11 +1268,19 @@ def setup(verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False) -> 
 
     existing_models = asyncio.run(_list_ollama_models(settings))
     if existing_models:
-        console.print(f"\nFound {len(existing_models)} model(s) already pulled: {', '.join(existing_models)}")
-        if Confirm.ask("Use one of these instead of pulling a new one?", default=True):
-            model = Prompt.ask("Which model", choices=existing_models, default=existing_models[0])
-            _write_env(provider="ollama", model=model)
-            _test_provider(ProviderType.OLLAMA, model)
+        console.print(f"\nFound {len(existing_models)} model(s) already pulled locally.")
+        existing_options = [(str(i), m, "Already pulled locally") for i, m in enumerate(existing_models, start=1)]
+        existing_options.append((str(len(existing_options) + 1), "__pull__", "Pull a new recommended model instead"))
+        chosen_existing = _select_menu_option(
+            existing_options,
+            title="Select a local Ollama model",
+            col_header="Model",
+            default_index=0,
+            cancel_value=None,
+        )
+        if chosen_existing != "__pull__":
+            _write_env(provider="ollama", model=chosen_existing)
+            _test_provider(ProviderType.OLLAMA, chosen_existing)
             return
 
     console.print("\nDetecting your hardware to recommend models that will run well locally...")
@@ -670,10 +1295,10 @@ def setup(verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False) -> 
     tier = recommend_tier(hardware)
     console.print(f"\n[bold]Recommended tier:[/bold] {tier.name}\n")
 
-    rec_table = Table(title="Recommended models")
-    rec_table.add_column("#")
-    rec_table.add_column("Model")
-    rec_table.add_column("Size")
+    rec_table = _styled_table("Recommended models")
+    rec_table.add_column("#", justify="right", style="dim")
+    rec_table.add_column("Model", style="cyan bold")
+    rec_table.add_column("Size", justify="right")
     rec_table.add_column("Notes")
     for i, rec in enumerate(tier.models, start=1):
         rec_table.add_row(str(i), rec.tag, rec.params, rec.blurb)
@@ -683,17 +1308,21 @@ def setup(verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False) -> 
         "https://ollama.com/library for anything newer.[/dim]\n"
     )
 
-    pick = Prompt.ask(
-        "Choose a model (1-5), type a model tag directly, or say 'you choose for me'",
-        default="you choose for me",
+    rec_options = [
+        (str(i), rec.tag, f"{rec.params} — {rec.blurb}") for i, rec in enumerate(tier.models, start=1)
+    ]
+    rec_options.append((str(len(rec_options) + 1), "__custom__", "Enter a custom Ollama model tag"))
+    picked_model = _select_menu_option(
+        rec_options,
+        title=f"Choose an Ollama model ({tier.name})",
+        col_header="Model",
+        default_index=0,
+        cancel_value=None,
     )
-    normalized = pick.strip().lower()
-    if normalized in ("you choose for me", "auto", "choose for me", ""):
-        chosen = tier.models[0].tag
-    elif normalized.isdigit() and 1 <= int(normalized) <= len(tier.models):
-        chosen = tier.models[int(normalized) - 1].tag
+    if picked_model == "__custom__":
+        chosen = Prompt.ask("Enter Ollama model tag", default=tier.models[0].tag).strip() or tier.models[0].tag
     else:
-        chosen = pick.strip()
+        chosen = picked_model
 
     console.print(f"\n[bold]Pulling[/bold] [cyan]{chosen}[/cyan] — this can take a while for larger models...")
     if shutil.which("ollama") is None:
@@ -751,7 +1380,7 @@ async def _qa_loop(state: RepositoryState, settings: Settings) -> None:
             except ProviderError as exc:
                 console.print(f"[red]Couldn't get an answer:[/red] {exc}")
                 continue
-            console.print(f"\n{answer}\n")
+            console.print(Panel(Markdown(answer), title="Answer", border_style="cyan", box=box.ROUNDED))
 
 
 @cli.command()
@@ -778,7 +1407,7 @@ def github(
         )
         raise typer.Exit(code=1)
     owner, repo_name = parsed
-    console.print(f"[bold]alex github[/bold] — {owner}/{repo_name}\n")
+    _print_banner("github", f"{owner}/{repo_name}")
 
     settings = get_settings()
     token = settings.github_token
@@ -799,10 +1428,16 @@ def github(
     visibility = "private" if access.private else "public"
     console.print(f"[green]Found it[/green] — {owner}/{repo_name} is {visibility}, and you have access.\n")
 
-    console.print("[bold]What would you like to do?[/bold]")
-    console.print("  [cyan]1[/cyan]. Build full documentation (README, architecture, API reference, ...)")
-    console.print("  [cyan]2[/cyan]. Ask questions about the repo (Q&A)")
-    choice = Prompt.ask("Choice", choices=["1", "2"], default="1")
+    choice = _select_menu_option(
+        [
+            ("1", "1", "Build full documentation (README, architecture, API reference, ...)"),
+            ("2", "2", "Ask questions about the repo (Q&A)"),
+        ],
+        title=f"What would you like to do with {owner}/{repo_name}?",
+        col_header="Action",
+        default_index=0,
+        cancel_value=None,
+    )
 
     cache_root = Path.home() / ".alex" / "github-repos" / f"{owner}__{repo_name}"
     if cache_root.exists():

@@ -131,9 +131,12 @@ def _apply_deterministic_checks(collection: ReviewCollection, state: RepositoryS
         if phrase_hits:
             issue_lines.extend(f'Contains banned generic phrase: "{phrase}"' for phrase in sorted(set(phrase_hits), key=str.lower))
 
-        missing_files = find_nonexistent_file_references(doc_text, real_paths, repository_root=state.repository_path)
-        if missing_files:
-            issue_lines.extend(f'References a file that doesn\'t exist in this repository: "{path}"' for path in missing_files)
+        if doc_name != "structure":
+            missing_files = find_nonexistent_file_references(doc_text, real_paths, repository_root=state.repository_path)
+            if missing_files:
+                issue_lines.extend(
+                    f'References a file that doesn\'t exist in this repository: "{path}"' for path in missing_files
+                )
 
         if not issue_lines:
             continue

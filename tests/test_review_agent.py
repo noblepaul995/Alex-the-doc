@@ -204,3 +204,16 @@ class TestApplyDeterministicChecks:
         state = self._state(tmp_path, {"structure": "This promotes flexibility and maintainability."})
         collection = _apply_deterministic_checks(ReviewCollection(), state)
         assert collection.by_doc("structure").passed is False
+
+    def test_structure_ignores_quoted_banned_phrases_and_example_filenames(self, tmp_path: Path) -> None:
+        state = self._state(
+            tmp_path,
+            {
+                "structure": (
+                    '| `banned_phrases.py` | Targets "promotes flexibility" and "ensures maintainability". |\n'
+                    "| `license_detect.py` | Checks `LICENSE` or `LICENSE.md`. |"
+                )
+            },
+        )
+        collection = _apply_deterministic_checks(ReviewCollection(), state)
+        assert collection.results == []
